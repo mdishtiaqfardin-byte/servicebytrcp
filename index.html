@@ -1,0 +1,1969 @@
+<!DOCTYPE html>
+<html lang="bn" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TRCP AGENCY - Dual-Portal Booking & Management</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      // --- APP STATE ---
+      let currentPortal = 'client'; // 'client' or 'admin'
+      let isAdminLoggedIn = false;
+      let activeTab = 'home';
+      let activeAdminTab = 'dashboard';
+
+      // IndexedDB Helper for Collections
+      const DB_NAME = 'TRCP_DB';
+      const STORE_NAME = 'collections_store';
+      const DB_VERSION = 1;
+
+      function openDB() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+              db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+            }
+          };
+          request.onsuccess = (e) => resolve(e.target.result);
+          request.onerror = (e) => reject(e.target.error);
+        });
+      }
+
+      async function saveCollectionsToDB(collectionsArray) {
+        try {
+          const db = await openDB();
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          const store = tx.objectStore(STORE_NAME);
+          store.clear(); // sync clear
+          collectionsArray.forEach(item => store.put(item));
+          return new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve();
+            tx.onerror = (e) => reject(e.target.error);
+          });
+        } catch (err) {
+          console.error("Failed to save collections to IndexedDB:", err);
+        }
+      }
+
+      async function loadCollectionsFromDB() {
+        try {
+          const db = await openDB();
+          const tx = db.transaction(STORE_NAME, 'readonly');
+          const store = tx.objectStore(STORE_NAME);
+          const request = store.getAll();
+          return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = (e) => reject(e.target.error);
+          });
+        } catch (err) {
+          console.error("Failed to load collections from IndexedDB:", err);
+          return [];
+        }
+      }
+
+      // Utility to compress image files to prevent bloated Base64 strings
+      function compressImage(file, maxWidth = 800, maxHeight = 800, quality = 0.7) {
+        return new Promise((resolve, reject) => {
+          if (!file.type.startsWith('image/')) {
+            // If it's a video or non-image, fallback to standard FileReader
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.onerror = (e) => reject(e);
+            reader.readAsDataURL(file);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+              let width = img.width;
+              let height = img.height;
+
+              if (width > height) {
+                if (width > maxWidth) {
+                  height = Math.round((height * maxWidth) / width);
+                  width = maxWidth;
+                }
+              } else {
+                if (height > maxHeight) {
+                  width = Math.round((width * maxHeight) / height);
+                  height = maxHeight;
+                }
+              }
+
+              const canvas = document.createElement('canvas');
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(img, 0, 0, width, height);
+              resolve(canvas.toDataURL('image/jpeg', quality));
+            };
+            img.onerror = (err) => reject(err);
+            img.src = event.target.result;
+          };
+          reader.onerror = (err) => reject(err);
+          reader.readAsDataURL(file);
+        });
+      }
+
+      // Initial Default Data
+      let collections = [];
+      let defaultCollections = [
+        { id: '1', name: 'Nusrat Jahan', age: 22, code: 'TRCP-101', rate: 3500, city: 'Dhaka', cover: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=500', photos: [], videos: [], desc: 'Available for premium service.' },
+        { id: '2', name: 'Sultana Razia', age: 24, code: 'TRCP-102', rate: 4500, city: 'Chittagong', cover: 'https://images.unsplash.com/photo-1517841905240-472988babdf9?w=500', photos: [], videos: [], desc: 'Professional model and escort.' },
+        { id: '3', name: 'Anika Rahman', age: 21, code: 'TRCP-103', rate: 3000, city: 'Sylhet', cover: 'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=500', photos: [], videos: [], desc: 'Friendly and discreet.' }
+      ];
+
+      // Async Initialization for DB persistence
+      async function initStorage() {
+        const storedDB = await loadCollectionsFromDB();
+        if (storedDB && storedDB.length > 0) {
+          collections = storedDB;
+        } else {
+          // Fallback to initial local storage check or default array
+          const legacyStorage = localStorage.getItem('trcp_collections');
+          if (legacyStorage) {
+            try {
+              collections = JSON.parse(legacyStorage);
+            } catch(e) {
+              collections = defaultCollections;
+            }
+          } else {
+            collections = defaultCollections;
+          }
+          await saveCollectionsToDB(collections);
+        }
+        renderApp();
+      }
+
+      async function syncCollections() {
+        await saveCollectionsToDB(collections);
+        // Also update legacy key as fallback if lightweight
+        try {
+          localStorage.setItem('trcp_collections', JSON.stringify(collections.slice(0, 10)));
+        } catch(e) { /* ignore fallback errors */ }
+      }
+      // Handle Collection Add / Edit submission
+      async function handleSaveCollection(e) {
+        e.preventDefault();
+        const id = document.getElementById('coll-id').value;
+        const name = document.getElementById('coll-name').value;
+        const code = document.getElementById('coll-code').value;
+        const age = document.getElementById('coll-age').value;
+        const city = document.getElementById('coll-city').value;
+        const rate = document.getElementById('coll-rate').value;
+        const desc = document.getElementById('coll-desc').value;
+        const coverFileInput = document.getElementById('coll-cover-file');
+        const mediaFilesInput = document.getElementById('coll-media-files');
+
+        let coverUrl = document.getElementById('coll-cover-url-preview').value || 'https://placehold.co/400x500?text=No+Cover';
+
+        if (coverFileInput.files && coverFileInput.files[0]) {
+          coverUrl = await compressImage(coverFileInput.files[0]);
+        }
+
+        let mediaPhotos = [];
+        let mediaVideos = [];
+
+        if (mediaFilesInput.files && mediaFilesInput.files.length > 0) {
+          for (let i = 0; i < mediaFilesInput.files.length; i++) {
+            const file = mediaFilesInput.files[i];
+            const dataUrl = await compressImage(file);
+            if (file.type.startsWith('video/')) {
+              mediaVideos.push(dataUrl);
+            } else {
+              mediaPhotos.push(dataUrl);
+            }
+          }
+        }
+
+        if (id) {
+          // Edit existing
+          const idx = collections.findIndex(c => c.id === id);
+          if (idx !== -1) {
+            collections[idx] = {
+              ...collections[idx],
+              name, code, age: parseInt(age), city, rate: parseInt(rate), desc,
+              cover: coverUrl.startsWith('data:') ? coverUrl : (collections[idx].cover || coverUrl),
+              photos: mediaPhotos.length > 0 ? [...collections[idx].photos, ...mediaPhotos] : collections[idx].photos,
+              videos: mediaVideos.length > 0 ? [...collections[idx].videos, ...mediaVideos] : collections[idx].videos
+            };
+          }
+        } else {
+          // Add new item
+          const newColl = {
+            id: Date.now().toString(),
+            name,
+            code,
+            age: parseInt(age),
+            city,
+            rate: parseInt(rate),
+            desc,
+            cover: coverUrl,
+            photos: mediaPhotos,
+            videos: mediaVideos
+          };
+          collections.push(newColl);
+        }
+
+        await syncCollections();
+        closeModal();
+        renderApp();
+      }
+
+      async function deleteCollection(id) {
+        if (confirm("Are you sure you want to delete this collection profile?")) {
+          collections = collections.filter(c => c.id !== id);
+          await syncCollections();
+          renderApp();
+        }
+      }
+
+      window.onload = function() {
+        initStorage();
+      };
+    </script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Alpine.js -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #0b0f19;
+            color: #f3f4f6;
+        }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #111827;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #374151;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #f59e0b;
+        }
+        .gold-gradient-text {
+            background: linear-gradient(135deg, #fef3c7 0%, #f59e0b 50%, #b45309 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .gold-btn {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+            color: #000;
+            font-weight: 600;
+        }
+        .gold-btn:hover {
+            background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+        }
+    </style>
+</head>
+<body x-data="appData()" x-init="initApp()" class="min-h-screen flex flex-col justify-between selection:bg-brand-500 selection:text-black">
+
+    <!-- TOP HEADER -->
+    <header class="sticky top-0 z-40 bg-darkcard/90 backdrop-blur border-b border-darkborder shadow-md">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center space-x-3 cursor-pointer" @click="currentTab = 'home'">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-600 to-brand-400 flex items-center justify-center text-black font-black text-xl shadow-lg shadow-brand-500/20">
+                    T
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold tracking-wider gold-gradient-text">TRCP AGENCY</h1>
+                    <p class="text-xs text-gray-400" x-text="lang === 'bn' ? 'প্রিমিয়াম সার্ভিস প্ল্যাটফর্ম' : 'Premium Service Platform'"></p>
+                </div>
+            </div>
+
+            <!-- Header Actions -->
+            <div class="flex items-center space-x-3">
+                <!-- Language Toggle -->
+                <button @click="toggleLang()" class="px-3 py-1.5 rounded-lg border border-brand-500/30 text-xs font-semibold text-brand-400 hover:bg-brand-500/10 transition flex items-center gap-1">
+                    <i class="fa-solid font-bold fa-language text-sm"></i>
+                    <span x-text="lang === 'bn' ? 'English' : 'বাংলা'"></span>
+                </button>
+
+                <!-- Auth / Admin Quick Buttons -->
+                <template x-if="!currentUser && !isAdminLoggedIn">
+                    <div class="flex items-center gap-2">
+                        <button @click="openAuthModal('login')" class="px-3 py-1.5 rounded-lg gold-btn text-xs font-bold transition">
+                            <span x-text="lang === 'bn' ? 'লগইন' : 'Login'"></span>
+                        </button>
+                        <button @click="openAuthModal('register')" class="px-3 py-1.5 rounded-lg bg-gray-800 text-gray-200 text-xs font-semibold hover:bg-gray-700 transition">
+                            <span x-text="lang === 'bn' ? 'রেজিস্ট্রেশন' : 'Register'"></span>
+                        </button>
+                    </div>
+                </template>
+
+                <template x-if="currentUser && !isAdminLoggedIn">
+                    <div class="flex items-center gap-3">
+                        <span class="text-xs text-brand-400 font-medium hidden sm:inline" x-text="currentUser.name"></span>
+                        <button @click="currentTab = 'history'" class="px-3 py-1.5 rounded-lg bg-brand-500/20 border border-brand-500/40 text-brand-300 text-xs font-medium hover:bg-brand-500/30 transition flex items-center gap-1">
+                            <i class="fa-solid fa-clock-history"></i>
+                            <span x-text="lang === 'bn' ? 'বুকিং হিস্ট্রি' : 'History'"></span>
+                        </button>
+                        <button @click="logoutClient()" class="p-1.5 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs">
+                            <i class="fa-solid fa-right-from-bracket"></i>
+                        </button>
+                    </div>
+                </template>
+
+                <template x-if="isAdminLoggedIn">
+                    <div class="flex items-center gap-2">
+                        <span class="px-2 py-1 rounded bg-red-500/20 text-red-400 text-xs font-bold border border-red-500/30">ADMIN PORTAL</span>
+                        <button @click="logoutAdmin()" class="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition">
+                            <span x-text="lang === 'bn' ? 'লগআউট' : 'Logout'"></span>
+                        </button>
+                    </div>
+                </template>
+
+                <!-- Hidden Admin Portal Trigger -->
+                <button @click="openAdminAuthModal()" class="text-gray-600 hover:text-brand-500 p-1 text-xs transition opacity-30 hover:opacity-100" title="Admin Security Access">
+                    <i class="fa-solid fa-shield-halved"></i>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- MAIN CONTENT AREA -->
+    <main class="max-w-7xl mx-auto px-4 py-6 flex-grow w-full">
+
+        <!-- ================= CLIENT PORTAL ================= -->
+        <template x-if="!isAdminLoggedIn">
+            <div>
+                <!-- Navigation Tabs -->
+                <div class="flex items-center justify-center gap-2 mb-6 border-b border-darkborder pb-3 overflow-x-auto">
+                    <button @click="currentTab = 'home'" :class="currentTab === 'home' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400 hover:text-white'" class="px-4 py-2 rounded-xl text-sm transition flex items-center gap-2 whitespace-nowrap">
+                        <i class="fa-solid fa-house"></i>
+                        <span x-text="lang === 'bn' ? 'হোম পেইজ' : 'Home'"></span>
+                    </button>
+                    <button @click="selectServiceType('real')" :class="currentTab === 'real' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400 hover:text-white'" class="px-4 py-2 rounded-xl text-sm transition flex items-center gap-2 whitespace-nowrap">
+                        <i class="fa-solid fa-user-group"></i>
+                        <span x-text="lang === 'bn' ? 'রিয়েল সার্ভিস' : 'Real Service'"></span>
+                    </button>
+                    <button @click="selectServiceType('video')" :class="currentTab === 'video' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400 hover:text-white'" class="px-4 py-2 rounded-xl text-sm transition flex items-center gap-2 whitespace-nowrap">
+                        <i class="fa-solid fa-video"></i>
+                        <span x-text="lang === 'bn' ? 'ভিডিও সার্ভিস' : 'Video Service'"></span>
+                    </button>
+                    <button @click="selectServiceType('live')" :class="currentTab === 'live' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400 hover:text-white'" class="px-4 py-2 rounded-xl text-sm transition flex items-center gap-2 whitespace-nowrap">
+                        <i class="fa-solid fa-tower-broadcast"></i>
+                        <span x-text="lang === 'bn' ? 'লাইভ শো' : 'Live Show'"></span>
+                    </button>
+                    <template x-if="currentUser">
+                        <button @click="currentTab = 'history'" :class="currentTab === 'history' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400 hover:text-white'" class="px-4 py-2 rounded-xl text-sm transition flex items-center gap-2 whitespace-nowrap">
+                            <i class="fa-solid fa-list-check"></i>
+                            <span x-text="lang === 'bn' ? 'বুকিং হিস্ট্রি' : 'My Bookings'"></span>
+                        </button>
+                    </template>
+                </div>
+
+                <!-- 1. HOME VIEW -->
+                <div x-show="currentTab === 'home'" class="space-y-8">
+                    <!-- Hero Banner -->
+                    <div class="relative rounded-3xl bg-gradient-to-r from-darkcard via-darkborder to-darkcard border border-brand-500/20 p-6 md:p-12 overflow-hidden shadow-2xl text-center">
+                        <div class="absolute -top-12 -right-12 w-48 h-48 bg-brand-500/10 rounded-full blur-3xl"></div>
+                        <h2 class="text-3xl md:text-5xl font-extrabold gold-gradient-text mb-4" x-text="lang === 'bn' ? 'স্বাগতম TRCP AGENCY তে' : 'Welcome to TRCP AGENCY'"></h2>
+                        <p class="text-gray-300 max-w-2xl mx-auto text-sm md:text-base leading-relaxed mb-6" x-text="lang === 'bn' ? 'আমরা সরবরাহ করি নিরাপদ ও বিশ্বস্ত রিয়েল সার্ভিস, ভিডিও সার্ভিস এবং লাইভ শো। আপনার পছন্দের সার্ভিস নির্বাচন করুন।' : 'We provide safe and reliable Real Services, Video Services, and Live Shows. Choose your preferred service.'"></p>
+                        <div class="flex flex-wrap justify-center gap-4">
+                            <button @click="selectServiceType('real')" class="px-6 py-3 rounded-xl gold-btn text-sm font-bold shadow-lg shadow-brand-500/20 hover:scale-105 transition">
+                                <i class="fa-solid fa-calendar-check mr-2"></i>
+                                <span x-text="lang === 'bn' ? 'রিয়েল সার্ভিস বুক করুন' : 'Book Real Service'"></span>
+                            </button>
+                            <button @click="selectServiceType('video')" class="px-6 py-3 rounded-xl bg-gray-800 border border-brand-500/30 text-brand-400 text-sm font-bold hover:bg-gray-700 hover:scale-105 transition">
+                                <i class="fa-solid fa-circle-play mr-2"></i>
+                                <span x-text="lang === 'bn' ? 'ভিডিও সার্ভিস দেখুন' : 'Video Services'"></span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Services Showcase Cards -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div @click="selectServiceType('real')" class="bg-darkcard border border-darkborder hover:border-brand-500/50 p-6 rounded-2xl cursor-pointer transition transform hover:-translate-y-1 shadow-xl">
+                            <div class="w-12 h-12 rounded-xl bg-brand-500/10 text-brand-400 flex items-center justify-center text-2xl mb-4">
+                                <i class="fa-solid fa-location-dot"></i>
+                            </div>
+                            <h3 class="text-xl font-bold text-white mb-2" x-text="lang === 'bn' ? 'রিয়েল সার্ভিস' : 'Real Service'"></h3>
+                            <p class="text-xs text-gray-400 leading-relaxed mb-4" x-text="lang === 'bn' ? 'আপনার নিকটস্থ এরিয়া বেছে নিয়ে সহজে সরাসরি সার্ভিস পেতে আজই বুকিং করুন।' : 'Select your nearest main area and sub-area for direct physical appointment.'"></p>
+                            <span class="text-xs text-brand-400 font-semibold flex items-center gap-1">
+                                <span x-text="lang === 'bn' ? 'বুকিং শুরু করুন' : 'Book Now'"></span>
+                                <i class="fa-solid fa-arrow-right text-xs"></i>
+                            </span>
+                        </div>
+
+                        <div @click="selectServiceType('video')" class="bg-darkcard border border-darkborder hover:border-brand-500/50 p-6 rounded-2xl cursor-pointer transition transform hover:-translate-y-1 shadow-xl">
+                            <div class="w-12 h-12 rounded-xl bg-brand-500/10 text-brand-400 flex items-center justify-center text-2xl mb-4">
+                                <i class="fa-solid fa-video"></i>
+                            </div>
+                            <h3 class="text-xl font-bold text-white mb-2" x-text="lang === 'bn' ? 'ভিডিও সার্ভিস' : 'Video Service'"></h3>
+                            <p class="text-xs text-gray-400 leading-relaxed mb-4" x-text="lang === 'bn' ? '১০, ২০, ৩০ মিনিট ও ১ ঘণ্টার এক্সক্লুসিভ প্রাইভেট ভিডিও সার্ভিস উপভোগ করুন।' : 'Enjoy private 10m, 20m, 30m or 1 hour high quality video calls.'"></p>
+                            <span class="text-xs text-brand-400 font-semibold flex items-center gap-1">
+                                <span x-text="lang === 'bn' ? 'প্যাকেজ দেখুন' : 'Explore Packages'"></span>
+                                <i class="fa-solid fa-arrow-right text-xs"></i>
+                            </span>
+                        </div>
+
+                        <div @click="selectServiceType('live')" class="bg-darkcard border border-darkborder hover:border-brand-500/50 p-6 rounded-2xl cursor-pointer transition transform hover:-translate-y-1 shadow-xl">
+                            <div class="w-12 h-12 rounded-xl bg-brand-500/10 text-brand-400 flex items-center justify-center text-2xl mb-4">
+                                <i class="fa-solid fa-headset"></i>
+                            </div>
+                            <h3 class="text-xl font-bold text-white mb-2" x-text="lang === 'bn' ? 'লাইভ শো' : 'Live Show'"></h3>
+                            <p class="text-xs text-gray-400 leading-relaxed mb-4" x-text="lang === 'bn' ? '১০ দিন, ১ মাস বা ৩ মাসের স্পেশাল মেম্বারশিপ নিয়ে লাইভ উপভোগ করুন।' : 'Join extended 10-day, 1-month or 3-month live show memberships.'"></p>
+                            <span class="text-xs text-brand-400 font-semibold flex items-center gap-1">
+                                <span x-text="lang === 'bn' ? 'মেম্বারশিপ নিন' : 'Get Membership'"></span>
+                                <i class="fa-solid fa-arrow-right text-xs"></i>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. REAL SERVICE FLOW -->
+                <div x-show="currentTab === 'real'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-5 shadow-xl">
+                        <h2 class="text-lg font-bold text-brand-400 mb-4 flex items-center gap-2">
+                            <i class="fa-solid fa-map-location-dot"></i>
+                            <span x-text="lang === 'bn' ? 'রিয়েল সার্ভিস ফিল্টার ও সিলেকশন' : 'Real Service Location & Booking'"></span>
+                        </h2>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                            <!-- Main Area Select -->
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'মেন এরিয়া নির্বাচন করুন' : 'Select Main Area'"></label>
+                                <select x-model="realServiceFlow.mainAreaId" @change="onRealMainAreaChange()" class="w-full bg-darkbg border border-darkborder rounded-xl px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none">
+                                    <option value="" x-text="lang === 'bn' ? '-- এরিয়া পছন্দ করুন --' : '-- Choose Area --'"></option>
+                                    <template x-for="area in mainAreas" :key="area.id">
+                                        <option :value="area.id" x-text="area.name"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Sub Area Select -->
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'সাব এরিয়া নির্বাচন করুন' : 'Select Sub Area'"></label>
+                                <select x-model="realServiceFlow.subAreaId" :disabled="!realServiceFlow.mainAreaId" class="w-full bg-darkbg border border-darkborder rounded-xl px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none disabled:opacity-50">
+                                    <option value="" x-text="lang === 'bn' ? '-- সাব এরিয়া পছন্দ করুন --' : '-- Choose Sub Area --'"></option>
+                                    <template x-for="sub in filteredSubAreas" :key="sub.id">
+                                        <option :value="sub.id" x-text="sub.name + ' (' + sub.type + ')'"></option>
+                                    </template>
+                                </select>
+                            </div>
+
+                            <!-- Date Select (Next 10 Days) -->
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'তারিখ নির্বাচন করুন (১০ দিনের মধ্যে)' : 'Select Date (10 Days Window)'"></label>
+                                <select x-model="realServiceFlow.date" class="w-full bg-darkbg border border-darkborder rounded-xl px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none">
+                                    <template x-for="d in availableDatesWindow" :key="d">
+                                        <option :value="d" x-text="d"></option>
+                                    </template>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Available Profiles Grid -->
+                        <div class="mt-6">
+                            <h3 class="text-sm font-bold text-gray-300 mb-3 flex items-center justify-between">
+                                <span x-text="lang === 'bn' ? 'উপলব্ধ কালেকশন সমূহ' : 'Available Collection Profiles'"></span>
+                                <span class="text-xs text-gray-400 font-normal" x-text="getAvailableProfilesForReal().length + ' Profiles Found'"></span>
+                            </h3>
+
+                            <template x-if="getAvailableProfilesForReal().length === 0">
+                                <div class="bg-darkbg/50 border border-darkborder rounded-xl p-8 text-center text-gray-400 text-sm">
+                                    <i class="fa-solid fa-folder-open text-3xl mb-2 text-gray-600"></i>
+                                    <p x-text="lang === 'bn' ? 'নির্বাচিত এরিয়া ও তারিখে কোনো কালেকশন পাওয়া যায়নি।' : 'No collection profiles available for selected area and date.'"></p>
+                                </div>
+                            </template>
+
+                            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                                <template x-for="profile in getAvailableProfilesForReal()" :key="profile.id">
+                                    <div class="bg-darkbg border border-darkborder hover:border-brand-500/40 rounded-xl overflow-hidden shadow-lg flex flex-col justify-between">
+                                        <div>
+                                            <!-- Media Carousel / Preview -->
+                                            <div class="relative h-48 bg-black">
+                                                <img :src="profile.gallery[0] || 'https://placehold.co/400x400/1f2937/d97706?text=No+Photo'" class="w-full h-full object-cover">
+                                                <div class="absolute top-2 right-2 bg-black/70 backdrop-blur px-2 py-1 rounded text-xs text-brand-400 font-bold border border-brand-500/30" x-text="'Code: ' + profile.code"></div>
+                                                <div class="absolute bottom-2 left-2 bg-black/70 px-2 py-1 rounded text-[10px] text-gray-200" x-text="profile.category"></div>
+                                                <button @click="openGalleryModal(profile)" class="absolute bottom-2 right-2 bg-brand-500 text-black p-1.5 rounded-lg text-xs font-bold hover:bg-brand-400">
+                                                    <i class="fa-solid fa-images mr-1"></i> <span x-text="profile.gallery.length"></span> Photos
+                                                </button>
+                                            </div>
+
+                                            <div class="p-3">
+                                                <h4 class="font-bold text-white text-sm" x-text="profile.name"></h4>
+                                                <p class="text-xs text-gray-400 mt-0.5" x-text="profile.customRates ? 'Custom Rates Applicable' : 'Standard Rates'"></p>
+                                            </div>
+                                        </div>
+
+                                        <div class="p-3 pt-0">
+                                            <button @click="startBookingReal(profile)" class="w-full py-2 rounded-lg gold-btn text-xs font-bold transition">
+                                                <span x-text="lang === 'bn' ? 'বুকিং এর জন্য নির্বাচন করুন' : 'Select & Proceed'"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. VIDEO SERVICE FLOW -->
+                <div x-show="currentTab === 'video'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-5 shadow-xl">
+                        <h2 class="text-lg font-bold text-brand-400 mb-2 flex items-center gap-2">
+                            <i class="fa-solid fa-video"></i>
+                            <span x-text="lang === 'bn' ? 'আজকের এভেইলেবল ভিডিও সার্ভিস' : 'Today\'s Available Video Service'"></span>
+                        </h2>
+
+                        <!-- Category Selector -->
+                        <div class="flex flex-wrap gap-2 mb-6 border-b border-darkborder pb-4">
+                            <button @click="videoCategoryFilter = 'Medium'" :class="videoCategoryFilter === 'Medium' ? 'bg-brand-500 text-black font-bold' : 'bg-darkbg text-gray-300'" class="px-4 py-2 rounded-xl text-xs transition">
+                                Medium (01-100)
+                            </button>
+                            <button @click="videoCategoryFilter = 'Premium'" :class="videoCategoryFilter === 'Premium' ? 'bg-brand-500 text-black font-bold' : 'bg-darkbg text-gray-300'" class="px-4 py-2 rounded-xl text-xs transition">
+                                Premium (101-200)
+                            </button>
+                            <button @click="videoCategoryFilter = 'Special'" :class="videoCategoryFilter === 'Special' ? 'bg-brand-500 text-black font-bold' : 'bg-darkbg text-gray-300'" class="px-4 py-2 rounded-xl text-xs transition">
+                                New Collection (301-399)
+                            </button>
+                        </div>
+
+                        <!-- Video Rates Chart -->
+                        <div class="bg-darkbg border border-darkborder rounded-xl p-4 mb-6">
+                            <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider mb-2" x-text="lang === 'bn' ? 'সার্ভিস রেট চার্ট' : 'Service Rates List'"></h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                                <template x-for="rate in getVideoRatesForCategory(videoCategoryFilter)" :key="rate.duration">
+                                    <div class="bg-darkcard p-3 rounded-lg border border-darkborder">
+                                        <p class="font-bold text-gray-200" x-text="rate.duration"></p>
+                                        <p class="text-[10px] text-gray-400 mb-1" x-text="rate.desc"></p>
+                                        <p class="text-brand-400 font-extrabold text-sm" x-text="rate.price + ' BDT'"></p>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Profiles Available Today -->
+                        <h3 class="text-sm font-bold text-gray-200 mb-3" x-text="lang === 'bn' ? 'আজকের উপলব্ধ কালেকশন প্রোফাইল' : 'Today\'s Video Profiles'"></h3>
+                        
+                        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                            <template x-for="profile in getAvailableVideoProfiles()" :key="profile.id">
+                                <div class="bg-darkbg border border-darkborder rounded-xl overflow-hidden shadow-lg flex flex-col justify-between">
+                                    <div>
+                                        <div class="relative h-44 bg-black">
+                                            <img :src="profile.gallery[0] || 'https://placehold.co/400x400/1f2937/d97706?text=No+Photo'" class="w-full h-full object-cover">
+                                            <div class="absolute top-2 right-2 bg-black/70 px-2 py-1 rounded text-xs text-brand-400 font-bold border border-brand-500/30" x-text="'Code: ' + profile.code"></div>
+                                            <button @click="openGalleryModal(profile)" class="absolute bottom-2 right-2 bg-brand-500 text-black p-1.5 rounded-lg text-xs font-bold">
+                                                <i class="fa-solid fa-images mr-1"></i> Gallery
+                                            </button>
+                                        </div>
+                                        <div class="p-3">
+                                            <h4 class="font-bold text-white text-sm" x-text="profile.name"></h4>
+                                        </div>
+                                    </div>
+
+                                    <div class="p-3 pt-0">
+                                        <button @click="startBookingVideo(profile)" class="w-full py-2 rounded-lg gold-btn text-xs font-bold">
+                                            <span x-text="lang === 'bn' ? 'ভিডিও সার্ভিস সিলেক্ট করুন' : 'Select Video Service'"></span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 4. LIVE SHOW FLOW -->
+                <div x-show="currentTab === 'live'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl max-w-3xl mx-auto">
+                        <h2 class="text-xl font-bold text-brand-400 mb-2 text-center" x-text="lang === 'bn' ? 'লাইভ শো মেম্বারশিপ প্যাকেজ' : 'Live Show Membership Packages'"></h2>
+                        <p class="text-xs text-gray-400 text-center mb-8" x-text="lang === 'bn' ? 'আপনার পছন্দের মেয়াদ বেছে নিয়ে সরাসরি লাইভ শো এক্সেস নিন।' : 'Choose your desired duration package for full access.'"></p>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <!-- Package 1 -->
+                            <div class="bg-darkbg border border-darkborder hover:border-brand-500 p-5 rounded-2xl text-center flex flex-col justify-between">
+                                <div>
+                                    <div class="w-12 h-12 bg-brand-500/10 rounded-full flex items-center justify-center text-brand-400 mx-auto text-xl mb-3">
+                                        <i class="fa-solid fa-bolt"></i>
+                                    </div>
+                                    <h3 class="font-bold text-white text-lg" x-text="lang === 'bn' ? '১০ দিন মেয়াদি' : '10 Days Pass'"></h3>
+                                    <p class="text-2xl font-black text-brand-400 my-4">550 BDT</p>
+                                    <p class="text-xs text-gray-400 mb-4" x-text="lang === 'bn' ? '১০ দিনের জন্য আনলিমিটেড লাইভ শো এক্সেস।' : 'Unlimited 10 days access.'"></p>
+                                </div>
+                                <button @click="startBookingLive('10 Days Live Pass', 550)" class="w-full py-2.5 rounded-xl gold-btn text-xs font-bold">
+                                    <span x-text="lang === 'bn' ? 'প্যাকেজটি সিলেক্ট করুন' : 'Select Package'"></span>
+                                </button>
+                            </div>
+
+                            <!-- Package 2 -->
+                            <div class="bg-darkbg border-2 border-brand-500 p-5 rounded-2xl text-center flex flex-col justify-between relative shadow-lg shadow-brand-500/10">
+                                <span class="absolute -top-3 left-1/2 -translate-x-1/2 bg-brand-500 text-black font-extrabold text-[10px] px-3 py-0.5 rounded-full uppercase" x-text="lang === 'bn' ? 'জনপ্রিয়' : 'Popular'"></span>
+                                <div>
+                                    <div class="w-12 h-12 bg-brand-500/10 rounded-full flex items-center justify-center text-brand-400 mx-auto text-xl mb-3">
+                                        <i class="fa-solid fa-crown"></i>
+                                    </div>
+                                    <h3 class="font-bold text-white text-lg" x-text="lang === 'bn' ? '১ মাস মেয়াদি' : '1 Month Pass'"></h3>
+                                    <p class="text-2xl font-black text-brand-400 my-4">1020 BDT</p>
+                                    <p class="text-xs text-gray-400 mb-4" x-text="lang === 'bn' ? '৩০ দিনের পূর্ণ প্রাইভেট লাইভ এক্সপেরিয়েন্স।' : 'Full 30 days VIP live access.'"></p>
+                                </div>
+                                <button @click="startBookingLive('1 Month Live VIP', 1020)" class="w-full py-2.5 rounded-xl gold-btn text-xs font-bold">
+                                    <span x-text="lang === 'bn' ? 'প্যাকেজটি সিলেক্ট করুন' : 'Select Package'"></span>
+                                </button>
+                            </div>
+
+                            <!-- Package 3 -->
+                            <div class="bg-darkbg border border-darkborder hover:border-brand-500 p-5 rounded-2xl text-center flex flex-col justify-between">
+                                <div>
+                                    <div class="w-12 h-12 bg-brand-500/10 rounded-full flex items-center justify-center text-brand-400 mx-auto text-xl mb-3">
+                                        <i class="fa-solid fa-gem"></i>
+                                    </div>
+                                    <h3 class="font-bold text-white text-lg" x-text="lang === 'bn' ? '৩ মাস মেয়াদি' : '3 Months Pass'"></h3>
+                                    <p class="text-2xl font-black text-brand-400 my-4">1850 BDT</p>
+                                    <p class="text-xs text-gray-400 mb-4" x-text="lang === 'bn' ? '৯০ দিনের বেস্ট ভ্যালু মেম্বারশিপ।' : '90 days best value pass.'"></p>
+                                </div>
+                                <button @click="startBookingLive('3 Months Live Mega Pass', 1850)" class="w-full py-2.5 rounded-xl gold-btn text-xs font-bold">
+                                    <span x-text="lang === 'bn' ? 'প্যাকেজটি সিলেক্ট করুন' : 'Select Package'"></span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 5. CLIENT BOOKING HISTORY -->
+                <div x-show="currentTab === 'history'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                        <h2 class="text-lg font-bold text-brand-400 mb-4 flex items-center gap-2">
+                            <i class="fa-solid fa-clock-history"></i>
+                            <span x-text="lang === 'bn' ? 'আমার বুকিং ইতিহাস' : 'My Booking History'"></span>
+                        </h2>
+
+                        <template x-if="getUserBookings().length === 0">
+                            <div class="text-center py-10 text-gray-400 text-sm">
+                                <i class="fa-solid fa-receipt text-4xl mb-3 text-gray-600"></i>
+                                <p x-text="lang === 'bn' ? 'আপনার কোনো পূর্বের বুকিং পাওয়া যায়নি।' : 'No booking history found.'"></p>
+                            </div>
+                        </template>
+
+                        <div class="space-y-4">
+                            <template x-for="b in getUserBookings()" :key="b.id">
+                                <div class="bg-darkbg border border-darkborder rounded-xl p-4 flex flex-col md:flex-row justify-between md:items-center gap-4">
+                                    <div>
+                                        <div class="flex items-center gap-2 mb-1">
+                                            <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase"
+                                                  :class="b.status === 'Confirmed' ? 'bg-green-500/20 text-green-400 border border-green-500/30' : (b.status === 'Cancelled' ? 'bg-red-500/20 text-red-400 border border-red-500/30' : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30')"
+                                                  x-text="b.status"></span>
+                                            <span class="text-xs font-bold text-white" x-text="b.serviceType.toUpperCase()"></span>
+                                            <span class="text-xs text-gray-500" x-text="'#' + b.id.substr(-6)"></span>
+                                        </div>
+                                        <p class="text-sm font-semibold text-gray-200" x-text="b.details"></p>
+                                        <p class="text-xs text-gray-400 mt-1" x-text="'TrxID/Last4: ' + b.trxDetails + ' | Method: ' + b.paymentMethod"></p>
+                                        <p class="text-[10px] text-gray-500" x-text="b.createdAt"></p>
+                                    </div>
+
+                                    <div class="text-right flex flex-col md:items-end justify-center">
+                                        <p class="text-xs text-gray-400" x-text="lang === 'bn' ? 'মোট মূল্য:' : 'Total Amount:'"></p>
+                                        <p class="text-base font-extrabold text-brand-400" x-text="b.totalRate + ' BDT'"></p>
+                                        <p class="text-[11px] text-gray-300" x-text="'Advance: ' + b.advancePaid + ' BDT (' + b.remainingHandCash + ' Hand Cash)'"></p>
+                                        <p class="text-[10px] text-gray-500 mt-1" x-text="lang === 'bn' ? 'বুকিং ক্যানসেল করতে হেল্পলাইন এ যোগাযোগ করুন।' : 'Contact helpline to cancel booking.'"></p>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </template>
+
+
+        <!-- ================= ADMIN DASHBOARD ================= -->
+        <template x-if="isAdminLoggedIn">
+            <div class="space-y-6">
+                <!-- Admin Navigation Tabs -->
+                <div class="flex items-center gap-2 border-b border-darkborder pb-3 overflow-x-auto">
+                    <button @click="adminTab = 'bookings'" :class="adminTab === 'bookings' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-list-check mr-1"></i> Bookings & Payments
+                    </button>
+                    <button @click="adminTab = 'collections'" :class="adminTab === 'collections' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-users mr-1"></i> Collection Profiles (<span x-text="collections.length"></span>/500)
+                    </button>
+                    <button @click="adminTab = 'availability'" :class="adminTab === 'availability' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-calendar-days mr-1"></i> 10-Day Real Schedule
+                    </button>
+                    <button @click="adminTab = 'locations'" :class="adminTab === 'locations' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-map-pin mr-1"></i> Locations Manager
+                    </button>
+                    <button @click="adminTab = 'users'" :class="adminTab === 'users' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-user-shield mr-1"></i> Registered Clients
+                    </button>
+                    <button @click="adminTab = 'settings'" :class="adminTab === 'settings' ? 'bg-brand-500 text-black font-bold' : 'bg-darkcard text-gray-400'" class="px-4 py-2 rounded-xl text-xs transition whitespace-nowrap">
+                        <i class="fa-solid fa-gears mr-1"></i> Payment Numbers & Services
+                    </button>
+                </div>
+
+                <!-- ADMIN TAB 1: BOOKING APPROVAL & DELETION -->
+                <div x-show="adminTab === 'bookings'" class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                    <h3 class="text-base font-bold text-white mb-4 flex items-center justify-between">
+                        <span>Client Bookings & Verification</span>
+                        <span class="text-xs text-gray-400" x-text="bookings.length + ' Total Bookings'"></span>
+                    </h3>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs text-gray-300">
+                            <thead class="bg-darkbg text-gray-400 uppercase text-[10px]">
+                                <tr>
+                                    <th class="p-3">Client Info</th>
+                                    <th class="p-3">Service Details</th>
+                                    <th class="p-3">Rates Breakdown</th>
+                                    <th class="p-3">Payment Info</th>
+                                    <th class="p-3">Status</th>
+                                    <th class="p-3 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-darkborder">
+                                <template x-for="b in bookings" :key="b.id">
+                                    <tr>
+                                        <td class="p-3">
+                                            <p class="font-bold text-white" x-text="b.clientName"></p>
+                                            <p class="text-gray-400" x-text="b.clientPhone"></p>
+                                        </td>
+                                        <td class="p-3">
+                                            <p class="font-semibold text-brand-400" x-text="b.serviceType.toUpperCase()"></p>
+                                            <p class="text-[11px] text-gray-300" x-text="b.details"></p>
+                                        </td>
+                                        <td class="p-3">
+                                            <p class="font-bold text-white" x-text="b.totalRate + ' BDT'"></p>
+                                            <p class="text-[10px] text-gray-400" x-text="'Adv: ' + b.advancePaid + ' | Cash: ' + b.remainingHandCash"></p>
+                                        </td>
+                                        <td class="p-3">
+                                            <p class="font-semibold text-gray-200" x-text="b.paymentMethod"></p>
+                                            <p class="text-[11px] text-gray-300" x-text="b.trxDetails"></p>
+                                            <template x-if="b.proofImage">
+                                                <button @click="openImagePreviewModal(b.proofImage)" class="text-brand-400 text-[10px] underline block mt-1">
+                                                    View Screenshot
+                                                </button>
+                                            </template>
+                                        </td>
+                                        <td class="p-3">
+                                            <span class="px-2 py-0.5 rounded text-[10px] font-bold"
+                                                  :class="b.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'"
+                                                  x-text="b.status"></span>
+                                        </td>
+                                        <td class="p-3 text-right space-x-1">
+                                            <template x-if="b.status === 'Pending'">
+                                                <button @click="approveBooking(b.id)" class="px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-[10px] font-bold">
+                                                    Confirm
+                                                </button>
+                                            </template>
+                                            <button @click="deleteBooking(b.id)" class="px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-bold" title="Reject & Delete Fake Booking">
+                                                Delete
+                                            </button>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- ADMIN TAB 2: COLLECTION PROFILES MANAGER -->
+                <div x-show="adminTab === 'collections'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-base font-bold text-white">Manage Collection Profiles (Max 500)</h3>
+                            <button @click="openCollectionModal()" class="px-3 py-1.5 gold-btn rounded-xl text-xs font-bold">
+                                + Add New Collection
+                            </button>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                            <template x-for="p in collections" :key="p.id">
+                                <div class="bg-darkbg border border-darkborder rounded-xl p-3 relative flex flex-col justify-between">
+                                    <div>
+                                        <div class="relative h-36 bg-black rounded-lg overflow-hidden mb-2">
+                                            <img :src="p.gallery[0] || 'https://placehold.co/400x400/1f2937/d97706?text=No+Photo'" class="w-full h-full object-cover">
+                                            <div class="absolute top-1 right-1 bg-black/80 px-2 py-0.5 rounded text-[10px] font-bold text-brand-400" x-text="'Code: ' + p.code"></div>
+                                        </div>
+                                        <h4 class="font-bold text-white text-sm" x-text="p.name"></h4>
+                                        <p class="text-xs text-gray-400" x-text="p.category"></p>
+                                        
+                                        <!-- Quick Toggles -->
+                                        <div class="flex items-center justify-between text-[11px] my-2 pt-2 border-t border-darkborder">
+                                            <span class="text-gray-400">Video Available Today:</span>
+                                            <button @click="toggleVideoAvailability(p.id)" class="px-2 py-0.5 rounded text-[10px] font-bold"
+                                                    :class="p.videoAvailable ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-gray-800 text-gray-500'">
+                                                <span x-text="p.videoAvailable ? 'YES' : 'NO'"></span>
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div class="flex items-center gap-2 pt-2 border-t border-darkborder">
+                                        <button @click="editCollection(p)" class="flex-1 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded text-xs font-semibold">Edit</button>
+                                        <button @click="deleteCollection(p.id)" class="p-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded text-xs"><i class="fa-solid fa-trash"></i></button>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ADMIN TAB 3: 10-DAY SCHEDULE MATRIX -->
+                <div x-show="adminTab === 'availability'" class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+                        <div>
+                            <h3 class="text-base font-bold text-white">10-Day Availability Scheduler Matrix</h3>
+                            <p class="text-xs text-gray-400">Enforces Strict Constraint: A Collection Code CANNOT be in multiple locations on the same date.</p>
+                        </div>
+
+                        <!-- Auto Balance Matrix Trigger -->
+                        <button @click="autoBalanceMatrix()" class="px-4 py-2 bg-brand-500/20 border border-brand-500/40 text-brand-300 hover:bg-brand-500/30 rounded-xl text-xs font-bold transition">
+                            <i class="fa-solid fa-wand-magic-sparkles mr-1"></i> Auto-Assign Distribution Matrix
+                        </button>
+                    </div>
+
+                    <!-- Matrix Controls -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 bg-darkbg p-4 rounded-xl border border-darkborder">
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Select Date</label>
+                            <select x-model="adminScheduleDate" class="w-full bg-darkcard border border-darkborder rounded-lg p-2 text-xs text-white">
+                                <template x-for="d in availableDatesWindow" :key="d">
+                                    <option :value="d" x-text="d"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Select Sub-Area</label>
+                            <select x-model="adminScheduleSubAreaId" class="w-full bg-darkcard border border-darkborder rounded-lg p-2 text-xs text-white">
+                                <template x-for="sub in allSubAreas" :key="sub.id">
+                                    <option :value="sub.id" x-text="sub.mainAreaName + ' - ' + sub.name"></option>
+                                </template>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Profiles Toggle List for Selected Date & Location -->
+                    <div class="space-y-3">
+                        <h4 class="text-xs font-bold text-gray-300 uppercase">Toggle Available Profiles for Selected Location & Date:</h4>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                            <template x-for="p in collections" :key="p.id">
+                                <div class="bg-darkbg border border-darkborder p-3 rounded-xl flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs font-bold text-white" x-text="p.name + ' (' + p.code + ')'"></p>
+                                        <p class="text-[10px] text-gray-400" x-text="p.category"></p>
+                                    </div>
+                                    <button @click="toggleProfileSchedule(p.code, adminScheduleDate, adminScheduleSubAreaId)"
+                                            class="px-2 py-1 rounded text-[10px] font-bold"
+                                            :class="isProfileScheduledHere(p.code, adminScheduleDate, adminScheduleSubAreaId) ? 'bg-green-500 text-black' : 'bg-gray-800 text-gray-500'">
+                                        <span x-text="isProfileScheduledHere(p.code, adminScheduleDate, adminScheduleSubAreaId) ? 'ASSIGNED' : 'OFF'"></span>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ADMIN TAB 4: LOCATIONS MANAGER -->
+                <div x-show="adminTab === 'locations'" class="space-y-6">
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-base font-bold text-white">Main Areas & Sub-Areas Management</h3>
+                            <div class="flex gap-2">
+                                <button @click="openAddMainAreaModal()" class="px-3 py-1.5 bg-gray-800 text-brand-400 rounded-xl text-xs font-bold border border-brand-500/30">+ Add Main Area</button>
+                                <button @click="openAddSubAreaModal()" class="px-3 py-1.5 gold-btn rounded-xl text-xs font-bold">+ Add Sub-Area</button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-4">
+                            <template x-for="main in mainAreas" :key="main.id">
+                                <div class="bg-darkbg border border-darkborder rounded-xl p-4">
+                                    <div class="flex items-center justify-between border-b border-darkborder pb-2 mb-3">
+                                        <h4 class="font-bold text-brand-400 text-sm" x-text="main.name"></h4>
+                                        <button @click="deleteMainArea(main.id)" class="text-red-400 text-xs hover:underline">Delete Main Area</button>
+                                    </div>
+
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                                        <template x-for="sub in getSubAreasForMain(main.id)" :key="sub.id">
+                                            <div class="bg-darkcard p-2 rounded-lg border border-darkborder flex items-center justify-between text-xs">
+                                                <div>
+                                                    <p class="font-semibold text-white" x-text="sub.name"></p>
+                                                    <span class="text-[9px] bg-brand-500/20 text-brand-300 px-1.5 py-0.5 rounded" x-text="sub.type"></span>
+                                                </div>
+                                                <button @click="deleteSubArea(sub.id)" class="text-gray-500 hover:text-red-400"><i class="fa-solid fa-xmark"></i></button>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ADMIN TAB 5: CLIENTS MANAGER & BANNING -->
+                <div x-show="adminTab === 'users'" class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                    <h3 class="text-base font-bold text-white mb-4">Registered Client Accounts & Passwords</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-xs text-gray-300">
+                            <thead class="bg-darkbg text-gray-400 uppercase text-[10px]">
+                                <tr>
+                                    <th class="p-3">Client Name</th>
+                                    <th class="p-3">Phone Number</th>
+                                    <th class="p-3">4-Digit Password</th>
+                                    <th class="p-3">Status</th>
+                                    <th class="p-3 text-right">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-darkborder">
+                                <template x-for="u in users" :key="u.phone">
+                                    <tr>
+                                        <td class="p-3 font-bold text-white" x-text="u.name"></td>
+                                        <td class="p-3 text-brand-400" x-text="u.phone"></td>
+                                        <td class="p-3 font-mono font-bold text-yellow-300" x-text="u.password"></td>
+                                        <td class="p-3">
+                                            <span class="px-2 py-0.5 rounded text-[10px] font-bold"
+                                                  :class="u.isBanned ? 'bg-red-500/20 text-red-400' : 'bg-green-500/20 text-green-400'"
+                                                  x-text="u.isBanned ? 'BANNED' : 'ACTIVE'"></span>
+                                        </td>
+                                        <td class="p-3 text-right">
+                                            <button @click="toggleBanUser(u.phone)" class="px-3 py-1 rounded text-xs font-bold"
+                                                    :class="u.isBanned ? 'bg-green-600 text-white' : 'bg-red-600 text-white'"
+                                                    x-text="u.isBanned ? 'UNBAN' : 'BAN'"></button>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- ADMIN TAB 6: PAYMENT NUMBERS & SERVICES MANAGER -->
+                <div x-show="adminTab === 'settings'" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- Gateways Numbers Update -->
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                        <h3 class="text-base font-bold text-white mb-4">Update Payment Gateways Numbers</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">bKash Number</label>
+                                <input type="text" x-model="paymentNumbers.bkash" class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Nagad Number</label>
+                                <input type="text" x-model="paymentNumbers.nagad" class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Rocket Number</label>
+                                <input type="text" x-model="paymentNumbers.rocket" class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                            </div>
+                            <button @click="savePaymentNumbers()" class="w-full py-2.5 gold-btn rounded-xl text-xs font-bold">Save Numbers</button>
+                        </div>
+                    </div>
+
+                    <!-- Dynamic Services & Memberships (Max 10) -->
+                    <div class="bg-darkcard border border-darkborder rounded-2xl p-6 shadow-xl">
+                        <h3 class="text-base font-bold text-white mb-4">Custom Services / Memberships (Max 10)</h3>
+                        <div class="space-y-3">
+                            <template x-for="(s, idx) in customServices" :key="idx">
+                                <div class="flex items-center gap-2">
+                                    <input type="text" x-model="s.title" placeholder="Service Name" class="flex-1 bg-darkbg border border-darkborder rounded-lg p-2 text-xs text-white">
+                                    <input type="number" x-model="s.price" placeholder="Price" class="w-24 bg-darkbg border border-darkborder rounded-lg p-2 text-xs text-white">
+                                    <button @click="removeCustomService(idx)" class="text-red-400 p-2"><i class="fa-solid fa-trash"></i></button>
+                                </div>
+                            </template>
+                            <button @click="addCustomService()" class="w-full py-2 bg-gray-800 text-brand-400 border border-brand-500/30 rounded-xl text-xs font-bold">+ Add Service Item</button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </template>
+
+    </main>
+
+    <!-- FLOATING HELPLINE & WHATSAPP / TELEGRAM BUTTONS -->
+    <div class="fixed bottom-5 right-5 z-50 flex flex-col items-end gap-2">
+        <a href="https://wa.me/8801823020470" target="_blank" class="w-12 h-12 rounded-full bg-green-500 hover:bg-green-600 text-white flex items-center justify-center text-2xl shadow-2xl transition transform hover:scale-110">
+            <i class="fa-brands fa-whatsapp"></i>
+        </a>
+        <a href="https://t.me/crsaaadmin03" target="_blank" class="w-12 h-12 rounded-full bg-sky-500 hover:bg-sky-600 text-white flex items-center justify-center text-2xl shadow-2xl transition transform hover:scale-110">
+            <i class="fa-brands fa-telegram"></i>
+        </a>
+    </div>
+
+    <!-- FOOTER -->
+    <footer class="bg-darkcard border-t border-darkborder py-4 mt-8">
+        <div class="max-w-7xl mx-auto px-4 text-center text-xs text-gray-500">
+            <p>&copy; 2026 TRCP AGENCY. All Rights Reserved. Confidential & Secure.</p>
+        </div>
+    </footer>
+
+
+    <!-- ================= MODALS ================= -->
+
+    <!-- 1. AUTH MODAL (CLIENT LOGIN / REGISTER) -->
+    <div x-show="showAuthModal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" x-cloak>
+        <div class="bg-darkcard border border-darkborder rounded-3xl p-6 w-full max-w-md shadow-2xl relative">
+            <button @click="showAuthModal = false" class="absolute top-4 right-4 text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+
+            <h3 class="text-xl font-bold text-white mb-2" x-text="authMode === 'login' ? (lang === 'bn' ? 'ক্লায়েন্ট লগইন' : 'Client Login') : (lang === 'bn' ? 'নতুন ক্লায়েন্ট রেজিস্ট্রেশন' : 'Client Registration')"></h3>
+            
+            <form @submit.prevent="handleClientAuth()" class="space-y-4 mt-4">
+                <template x-if="authMode === 'register'">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'আপনার নাম' : 'Your Name'"></label>
+                        <input type="text" x-model="authForm.name" required class="w-full bg-darkbg border border-darkborder rounded-xl p-3 text-sm text-white focus:border-brand-500 focus:outline-none">
+                    </div>
+                </template>
+
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'মোবাইল নম্বর' : 'Phone Number'"></label>
+                    <input type="text" x-model="authForm.phone" required class="w-full bg-darkbg border border-darkborder rounded-xl p-3 text-sm text-white focus:border-brand-500 focus:outline-none">
+                </div>
+
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? '৪ ডিজিটের পাসওয়ার্ড' : '4-Digit Password'"></label>
+                    <input type="password" maxlength="4" x-model="authForm.password" required class="w-full bg-darkbg border border-darkborder rounded-xl p-3 text-sm text-white focus:border-brand-500 focus:outline-none">
+                </div>
+
+                <template x-if="authMode === 'login'">
+                    <p class="text-[11px] text-gray-400" x-text="lang === 'bn' ? 'পাসওয়ার্ড ভুলে গেছেন? এডমিন/হেল্পলাইনে যোগাযোগ করুন।' : 'Forgot Password? Contact admin/helpline.'"></p>
+                </template>
+
+                <button type="submit" class="w-full py-3 gold-btn rounded-xl font-bold text-sm shadow-lg">
+                    <span x-text="authMode === 'login' ? (lang === 'bn' ? 'লগইন করুন' : 'Login') : (lang === 'bn' ? 'রেজিস্টার করুন' : 'Register')"></span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 2. SECRET ADMIN AUTH MODAL -->
+    <div x-show="showAdminAuthModal" class="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4" x-cloak>
+        <div class="bg-darkcard border border-brand-500/30 rounded-3xl p-6 w-full max-w-md shadow-2xl relative">
+            <button @click="showAdminAuthModal = false" class="absolute top-4 right-4 text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+
+            <h3 class="text-lg font-bold text-brand-400 mb-1">Restricted Admin Access</h3>
+            <p class="text-xs text-gray-400 mb-4">Enter master credentials to unlock Admin Dashboard.</p>
+
+            <form @submit.prevent="handleAdminLogin()" class="space-y-4">
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">Admin Phone / Contact</label>
+                    <input type="text" x-model="adminForm.phone" required class="w-full bg-darkbg border border-darkborder rounded-xl p-3 text-sm text-white focus:border-brand-500 focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">Admin Security Password</label>
+                    <input type="password" x-model="adminForm.password" required class="w-full bg-darkbg border border-darkborder rounded-xl p-3 text-sm text-white focus:border-brand-500 focus:outline-none">
+                </div>
+                <button type="submit" class="w-full py-3 bg-red-600 hover:bg-red-700 text-white rounded-xl font-bold text-sm">
+                    Authenticate Admin
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 3. PAYMENT & BOOKING MODAL -->
+    <div x-show="showPaymentModal" class="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto" x-cloak>
+        <div class="bg-darkcard border border-darkborder rounded-3xl p-6 w-full max-w-lg shadow-2xl my-8 relative">
+            <button @click="showPaymentModal = false" class="absolute top-4 right-4 text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+
+            <h3 class="text-xl font-bold text-brand-400 mb-2" x-text="lang === 'bn' ? 'পেমেন্ট ও বুকিং কনফার্মেশন' : 'Payment & Booking'"></h3>
+
+            <!-- Booking Summary -->
+            <div class="bg-darkbg border border-darkborder rounded-2xl p-4 mb-4 text-xs space-y-1.5">
+                <p class="font-bold text-white text-sm" x-text="activeBookingDraft.title"></p>
+                <p class="text-gray-400" x-text="activeBookingDraft.details"></p>
+                <div class="pt-2 border-t border-darkborder flex justify-between font-bold text-white">
+                    <span>Total Service Rate:</span>
+                    <span class="text-brand-400" x-text="activeBookingDraft.totalRate + ' BDT'"></span>
+                </div>
+                <div class="flex justify-between text-yellow-400 font-bold">
+                    <span>Required Advance Payment:</span>
+                    <span x-text="activeBookingDraft.advancePaid + ' BDT'"></span>
+                </div>
+                <div class="flex justify-between text-gray-400">
+                    <span>Remaining Balance (Hand Cash):</span>
+                    <span x-text="activeBookingDraft.remainingHandCash + ' BDT'"></span>
+                </div>
+            </div>
+
+            <!-- Payment Gateways Display -->
+            <div class="space-y-3 mb-6">
+                <p class="text-xs font-bold text-gray-300" x-text="lang === 'bn' ? 'পেমেন্ট নম্বর সমূহ (শুধুমাত্র সেন্ড মানি অথবা ক্যাশ ইন করবেন):' : 'Payment Numbers (Send Money / Cash In Only):'"></p>
+
+                <!-- bKash -->
+                <div class="bg-darkbg p-3 rounded-xl border border-darkborder flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <span class="bg-pink-600 text-white text-[10px] font-black px-2 py-0.5 rounded">bKash</span>
+                        <span class="text-xs font-mono font-bold text-white" x-text="paymentNumbers.bkash"></span>
+                    </div>
+                    <button @click="copyToClipboard(paymentNumbers.bkash)" class="px-2 py-1 bg-gray-800 text-brand-400 rounded text-[11px] font-semibold hover:bg-gray-700">
+                        <span x-text="lang === 'bn' ? 'কপি করুন' : 'Copy'"></span>
+                    </button>
+                </div>
+
+                <!-- Nagad -->
+                <div class="bg-darkbg p-3 rounded-xl border border-darkborder flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <span class="bg-orange-600 text-white text-[10px] font-black px-2 py-0.5 rounded">Nagad</span>
+                        <span class="text-xs font-mono font-bold text-white" x-text="paymentNumbers.nagad"></span>
+                    </div>
+                    <button @click="copyToClipboard(paymentNumbers.nagad)" class="px-2 py-1 bg-gray-800 text-brand-400 rounded text-[11px] font-semibold hover:bg-gray-700">
+                        <span x-text="lang === 'bn' ? 'কপি করুন' : 'Copy'"></span>
+                    </button>
+                </div>
+
+                <!-- Rocket -->
+                <div class="bg-darkbg p-3 rounded-xl border border-darkborder flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <span class="bg-purple-600 text-white text-[10px] font-black px-2 py-0.5 rounded">Rocket</span>
+                        <span class="text-xs font-mono font-bold text-white" x-text="paymentNumbers.rocket"></span>
+                    </div>
+                    <button @click="copyToClipboard(paymentNumbers.rocket)" class="px-2 py-1 bg-gray-800 text-brand-400 rounded text-[11px] font-semibold hover:bg-gray-700">
+                        <span x-text="lang === 'bn' ? 'কপি করুন' : 'Copy'"></span>
+                    </button>
+                </div>
+
+                <div class="bg-yellow-500/10 border border-yellow-500/30 p-2.5 rounded-xl text-[11px] text-yellow-300">
+                    <i class="fa-solid fa-triangle-exclamation mr-1"></i>
+                    <span x-text="lang === 'bn' ? 'সতর্কতা: উক্ত নাম্বারে শুধুমাত্র সেন্ড মানি অথবা ক্যাশ ইন গ্রহণ করা হয়। ঠিক ' + activeBookingDraft.advancePaid + ' BDT সেন্ড মানি অথবা ক্যাশ ইন করুন।' : 'Warning: Only Send Money or Cash In is accepted. Please send exactly ' + activeBookingDraft.advancePaid + ' BDT.'"></span>
+                </div>
+            </div>
+
+            <!-- Payment Method Form -->
+            <form @submit.prevent="submitBookingPayment()" class="space-y-4">
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'পেমেন্ট টাইপ নির্বাচন করুন' : 'Select Payment Type'"></label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <button type="button" @click="paymentForm.type = 'Send Money'" :class="paymentForm.type === 'Send Money' ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-darkborder bg-darkbg text-gray-400'" class="py-2 rounded-xl border text-xs font-bold transition">
+                            Send Money
+                        </button>
+                        <button type="button" @click="paymentForm.type = 'Cash In'" :class="paymentForm.type === 'Cash In' ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-darkborder bg-darkbg text-gray-400'" class="py-2 rounded-xl border text-xs font-bold transition">
+                            Cash In
+                        </button>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'পেমেন্ট গেটওয়ে' : 'Gateway Used'"></label>
+                    <select x-model="paymentForm.gateway" class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                        <option value="bKash">bKash</option>
+                        <option value="Nagad">Nagad</option>
+                        <option value="Rocket">Rocket</option>
+                    </select>
+                </div>
+
+                <template x-if="paymentForm.type === 'Send Money'">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'পেমেন্ট স্ক্রিনশট আপলোড করুন' : 'Upload Payment Screenshot'"></label>
+                        <input type="file" accept="image/*" @change="handleFileUpload($event)" class="w-full text-xs text-gray-400 bg-darkbg rounded-xl p-2 border border-darkborder">
+                    </div>
+                </template>
+
+                <template x-if="paymentForm.type === 'Cash In'">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1" x-text="lang === 'bn' ? 'লাস্ট ৪ ডিজিট লিখুন' : 'Enter Last 4 Digits'"></label>
+                        <input type="text" maxlength="4" x-model="paymentForm.last4" required class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                    </div>
+                </template>
+
+                <button type="submit" class="w-full py-3 gold-btn rounded-xl font-bold text-sm shadow-xl">
+                    <span x-text="lang === 'bn' ? 'বুকিং সাবমিট করুন' : 'Submit Booking'"></span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 4. GALLERY PREVIEW MODAL -->
+    <div x-show="showGalleryModal" class="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4" x-cloak>
+        <div class="bg-darkcard border border-darkborder rounded-3xl p-6 w-full max-w-2xl shadow-2xl relative">
+            <button @click="showGalleryModal = false" class="absolute top-4 right-4 text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+
+            <h3 class="text-base font-bold text-white mb-4" x-text="selectedGalleryProfile ? selectedGalleryProfile.name + ' Photo Gallery' : ''"></h3>
+
+            <div class="relative bg-black rounded-2xl overflow-hidden h-80 flex items-center justify-center">
+                <template x-if="selectedGalleryProfile && selectedGalleryProfile.gallery.length > 0">
+                    <img :src="selectedGalleryProfile.gallery[galleryActiveIndex]" class="max-h-full max-w-full object-contain">
+                </template>
+
+                <!-- Navigation Arrows -->
+                <button @click="prevPhoto()" class="absolute left-2 bg-black/60 text-white p-2 rounded-full hover:bg-brand-500 hover:text-black">
+                    <i class="fa-solid fa-chevron-left"></i>
+                </button>
+                <button @click="nextPhoto()" class="absolute right-2 bg-black/60 text-white p-2 rounded-full hover:bg-brand-500 hover:text-black">
+                    <i class="fa-solid fa-chevron-right"></i>
+                </button>
+            </div>
+
+            <!-- Thumbnails -->
+            <div class="flex gap-2 mt-4 overflow-x-auto pb-2">
+                <template x-if="selectedGalleryProfile">
+                    <template x-for="(img, idx) in selectedGalleryProfile.gallery" :key="idx">
+                        <img :src="img" @click="galleryActiveIndex = idx" :class="galleryActiveIndex === idx ? 'border-2 border-brand-500' : 'opacity-60'" class="w-16 h-16 object-cover rounded-lg cursor-pointer">
+                    </template>
+                </template>
+            </div>
+        </div>
+    </div>
+
+    <!-- 5. ADD / EDIT COLLECTION MODAL (ADMIN) -->
+    <div x-show="showCollectionModal" class="fixed inset-0 z-50 bg-black/90 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto" x-cloak>
+        <div class="bg-darkcard border border-darkborder rounded-3xl p-6 w-full max-w-xl shadow-2xl my-8 relative">
+            <button @click="showCollectionModal = false" class="absolute top-4 right-4 text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+
+            <h3 class="text-lg font-bold text-white mb-4" x-text="collectionForm.id ? 'Edit Collection Profile' : 'Add New Collection Profile'"></h3>
+
+            <form @submit.prevent="saveCollectionProfile()" class="space-y-4">
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Collection Name</label>
+                        <input type="text" x-model="collectionForm.name" required class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Code Number</label>
+                        <input type="text" x-model="collectionForm.code" required class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">Category</label>
+                    <select x-model="collectionForm.category" class="w-full bg-darkbg border border-darkborder rounded-xl p-2.5 text-xs text-white">
+                        <option value="Medium">Medium Category</option>
+                        <option value="Premium">Premium Category</option>
+                        <option value="Special">New Special Collection</option>
+                    </select>
+                </div>
+
+                <!-- Custom / Manual Rates Toggle -->
+                <div class="bg-darkbg p-3 rounded-xl border border-darkborder">
+                    <label class="flex items-center gap-2 cursor-pointer text-xs text-gray-300 font-semibold mb-2">
+                        <input type="checkbox" x-model="collectionForm.customRatesEnabled">
+                        <span>Enable Custom / Manual Rates for this Collection</span>
+                    </label>
+
+                    <template x-if="collectionForm.customRatesEnabled">
+                        <div class="grid grid-cols-2 gap-2 text-xs">
+                            <input type="number" x-model="collectionForm.rates['1 Hour']" placeholder="1 Hour Rate" class="bg-darkcard border border-darkborder p-2 rounded text-white">
+                            <input type="number" x-model="collectionForm.rates['2 Hours']" placeholder="2 Hours Rate" class="bg-darkcard border border-darkborder p-2 rounded text-white">
+                            <input type="number" x-model="collectionForm.rates['3 Hours']" placeholder="3 Hours Rate" class="bg-darkcard border border-darkborder p-2 rounded text-white">
+                            <input type="number" x-model="collectionForm.rates['Night']" placeholder="Night Rate" class="bg-darkcard border border-darkborder p-2 rounded text-white">
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Upload Photos (Max 5) -->
+                <div>
+                    <label class="block text-xs text-gray-400 mb-1">Upload Photos from Gallery (Max 5)</label>
+                    <input type="file" multiple accept="image/*" @change="handleMultiplePhotosUpload($event)" class="w-full text-xs text-gray-400 bg-darkbg rounded-xl p-2 border border-darkborder">
+                    
+                    <div class="flex gap-2 mt-2">
+                        <template x-for="(photo, idx) in collectionForm.gallery" :key="idx">
+                            <div class="relative w-16 h-16 rounded overflow-hidden border border-darkborder">
+                                <img :src="photo" class="w-full h-full object-cover">
+                                <button type="button" @click="collectionForm.gallery.splice(idx, 1)" class="absolute top-0 right-0 bg-red-600 text-white p-0.5 text-[10px]"><i class="fa-solid fa-xmark"></i></button>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full py-3 gold-btn rounded-xl font-bold text-xs shadow-xl">
+                    Save Collection Profile
+                </button>
+            </form>
+        </div>
+    </div>
+
+
+    <!-- ================= ALPINE APP SCRIPT ================= -->
+    <script>
+        function appData() {
+            return {
+                lang: 'bn', // 'bn' or 'en'
+                currentTab: 'home', // home, real, video, live, history
+                adminTab: 'bookings',
+
+                // Authentication State
+                currentUser: null,
+                isAdminLoggedIn: false,
+                showAuthModal: false,
+                authMode: 'login', // login / register
+                authForm: { name: '', phone: '', password: '' },
+
+                // Admin Master Credentials
+                showAdminAuthModal: false,
+                adminForm: { phone: '', password: '' },
+
+                // Seeded Location & Sub Areas
+                mainAreas: [
+                    { id: 'dhaka', name: 'ঢাকা (Dhaka)' },
+                    { id: 'ctg', name: 'চট্টগ্রাম (Chittagong)' },
+                    { id: 'cox', name: 'কক্সবাজার (Cox\'s Bazar)' },
+                    { id: 'raj', name: 'রাজশাহী (Rajshahi)' },
+                    { id: 'khu', name: 'খুলনা (Khulna)' },
+                    { id: 'bar', name: 'বরিশাল (Barishal)' },
+                    { id: 'cum', name: 'কুমিল্লা (Cumilla)' },
+                    { id: 'hab', name: 'হবিগঞ্জ (Habiganj)' },
+                    { id: 'syl', name: 'সিলেট (Sylhet)' }
+                ],
+                allSubAreas: [
+                    // Dhaka
+                    { id: 'uttara_3', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'উত্তরা সেক্টর ৩', type: 'Flat' },
+                    { id: 'uttara_7', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'উত্তরা সেক্টর ৭', type: 'Hotel' },
+                    { id: 'uttara_12', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'উত্তরা সেক্টর ১২', type: 'Hotel' },
+                    { id: 'mirpur_11_5', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'মিরপুর সাড়ে ১১ ইস্টার্ন হাউজিং D ব্লক', type: 'Flat' },
+                    { id: 'mirpur_12_bus', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'মিরপুর ১২ বাস স্ট্যান্ড', type: 'Hotel' },
+                    { id: 'farmgate_panthapath', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'ফার্মগেট পান্থপথ', type: 'Flat' },
+                    { id: 'farmgate_tejkunipara', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'ফার্মগেট তেজতুরি বাজার', type: 'Hotel' },
+                    { id: 'dhanmondi_10ra', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'ধানমণ্ডি ১০R/A', type: 'Flat' },
+                    { id: 'gulshan_shahjadpur', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'গুলশান শাহজাদপুর', type: 'Hotel' },
+                    { id: 'banani_c', mainAreaId: 'dhaka', mainAreaName: 'Dhaka', name: 'বনানী সি ব্লক', type: 'Flat' },
+                    
+                    // Chittagong
+                    { id: 'feni_mohipal', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'ফেনী মহিপাল', type: 'Hotel' },
+                    { id: 'sitakunda_college', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'সীতাকুণ্ড কলেজ রোড', type: 'Both' },
+                    { id: 'hathazari', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'হাটহাজারী', type: 'Both' },
+                    { id: 'kotwali', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'কোতোয়ালি', type: 'Hotel' },
+                    { id: 'gec', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'জি ই সি', type: 'Flat' },
+                    { id: 'agrabad', mainAreaId: 'ctg', mainAreaName: 'Chittagong', name: 'আগ্রাবাদ', type: 'Both' },
+
+                    // Sylhet
+                    { id: 'syl_zindabazar', mainAreaId: 'syl', mainAreaName: 'Sylhet', name: 'জিন্দাবাজার', type: 'Flat' },
+                    { id: 'syl_bondor', mainAreaId: 'syl', mainAreaName: 'Sylhet', name: 'বন্দর বাজার', type: 'Hotel' },
+                    { id: 'syl_madina', mainAreaId: 'syl', mainAreaName: 'Sylhet', name: 'মদিনা মার্কেট', type: 'Both' },
+                    { id: 'syl_amberkhana', mainAreaId: 'syl', mainAreaName: 'Sylhet', name: 'আম্বরখানা', type: 'Flat' }
+                ],
+
+                // Real Service Selection Form State
+                realServiceFlow: {
+                    mainAreaId: 'dhaka',
+                    subAreaId: 'uttara_3',
+                    date: ''
+                },
+                filteredSubAreas: [],
+
+                // Video Service Filter
+                videoCategoryFilter: 'Medium',
+
+                // Collections Database
+                collections: [],
+
+                // Schedule Matrix Map: { "DATE_SUBID": [code1, code2] }
+                scheduleMatrix: {},
+
+                // Gateway Payment Numbers
+                paymentNumbers: {
+                    bkash: '01847257668',
+                    nagad: '01971355287',
+                    rocket: '01788311044'
+                },
+
+                // Bookings Database
+                bookings: [],
+
+                // Registered Users Database
+                users: [
+                    { name: 'Demo Client', phone: '01700000000', password: '1234', isBanned: false }
+                ],
+
+                // Payment Draft & Modal
+                showPaymentModal: false,
+                activeBookingDraft: {},
+                paymentForm: {
+                    type: 'Send Money', // Send Money / Cash In
+                    gateway: 'bKash',
+                    proofImage: '',
+                    last4: ''
+                },
+
+                // Gallery Modal State
+                showGalleryModal: false,
+                selectedGalleryProfile: null,
+                galleryActiveIndex: 0,
+
+                // Admin Collection Form Modal
+                showCollectionModal: false,
+                collectionForm: {
+                    id: null,
+                    name: '',
+                    code: '',
+                    category: 'Medium',
+                    customRatesEnabled: false,
+                    rates: { '1 Hour': 2000, '2 Hours': 3200, '3 Hours': 4500, 'Night': 6000 },
+                    gallery: []
+                },
+
+                // Admin Scheduler Active Filters
+                adminScheduleDate: '',
+                adminScheduleSubAreaId: 'uttara_3',
+
+                // Custom Services
+                customServices: [
+                    { title: 'Special VIP Escort Service', price: 5000 },
+                    { title: 'Event Companion', price: 8000 }
+                ],
+
+                // 10-day Window Dates Generator
+                availableDatesWindow: [],
+
+                initApp() {
+                    this.generateDatesWindow();
+                    this.loadStoredData();
+                    this.seedInitialCollections();
+                    this.onRealMainAreaChange();
+                },
+
+                generateDatesWindow() {
+                    const dates = [];
+                    const today = new Date();
+                    for (let i = 0; i < 10; i++) {
+                        const d = new Date(today);
+                        d.setDate(today.getDate() + i);
+                        const dateStr = d.toISOString().split('T')[0];
+                        dates.push(dateStr);
+                    }
+                    this.availableDatesWindow = dates;
+                    this.realServiceFlow.date = dates[0];
+                    this.adminScheduleDate = dates[0];
+                },
+
+                toggleLang() {
+                    this.lang = this.lang === 'bn' ? 'en' : 'bn';
+                },
+
+                // DATA PERSISTENCE
+                loadStoredData() {
+                    const storedUsers = localStorage.getItem('trcp_users');
+                    if (storedUsers) this.users = JSON.parse(storedUsers);
+
+                    const storedCollections = localStorage.getItem('trcp_collections');
+                    if (storedCollections) this.collections = JSON.parse(storedCollections);
+
+                    const storedBookings = localStorage.getItem('trcp_bookings');
+                    if (storedBookings) this.bookings = JSON.parse(storedBookings);
+
+                    const storedSchedule = localStorage.getItem('trcp_schedule');
+                    if (storedSchedule) this.scheduleMatrix = JSON.parse(storedSchedule);
+
+                    const storedNumbers = localStorage.getItem('trcp_numbers');
+                    if (storedNumbers) this.paymentNumbers = JSON.parse(storedNumbers);
+                },
+
+                saveData() {
+                    localStorage.setItem('trcp_users', JSON.stringify(this.users));
+                    localStorage.setItem('trcp_collections', JSON.stringify(this.collections));
+                    localStorage.setItem('trcp_bookings', JSON.stringify(this.bookings));
+                    localStorage.setItem('trcp_schedule', JSON.stringify(this.scheduleMatrix));
+                    localStorage.setItem('trcp_numbers', JSON.stringify(this.paymentNumbers));
+                },
+
+                seedInitialCollections() {
+                    if (this.collections.length === 0) {
+                        const sampleGallery = [
+                            'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=600&q=80',
+                            'https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=600&q=80'
+                        ];
+
+                        this.collections = [
+                            { id: 1, name: 'Sumi Khan', code: '01', category: 'Medium', videoAvailable: true, gallery: sampleGallery },
+                            { id: 2, name: 'Nadia Ahmed', code: '02', category: 'Medium', videoAvailable: true, gallery: sampleGallery },
+                            { id: 3, name: 'Riya Chowdhury', code: '03', category: 'Medium', videoAvailable: false, gallery: sampleGallery },
+                            { id: 4, name: 'Priya Roy', code: '101', category: 'Premium', videoAvailable: true, gallery: sampleGallery },
+                            { id: 5, name: 'Tania Sheikh', code: '102', category: 'Premium', videoAvailable: true, gallery: sampleGallery },
+                            { id: 6, name: 'Anika Rahman', code: '103', category: 'Premium', videoAvailable: false, gallery: sampleGallery },
+                            { id: 7, name: 'Mitu Islam', code: '301', category: 'Special', videoAvailable: true, gallery: sampleGallery },
+                            { id: 8, name: 'Farhana Yeasmin', code: '302', category: 'Special', videoAvailable: true, gallery: sampleGallery }
+                        ];
+                        this.autoBalanceMatrix();
+                        this.saveData();
+                    }
+                },
+
+                // AUTHENTICATION LOGIC
+                openAuthModal(mode) {
+                    this.authMode = mode;
+                    this.showAuthModal = true;
+                },
+
+                handleClientAuth() {
+                    if (this.authMode === 'register') {
+                        const existing = this.users.find(u => u.phone === this.authForm.phone);
+                        if (existing) {
+                            alert('This phone number is already registered.');
+                            return;
+                        }
+                        const newUser = {
+                            name: this.authForm.name,
+                            phone: this.authForm.phone,
+                            password: this.authForm.password,
+                            isBanned: false
+                        };
+                        this.users.push(newUser);
+                        this.currentUser = newUser;
+                        this.saveData();
+                        this.showAuthModal = false;
+                        alert('Registration successful!');
+                    } else {
+                        const user = this.users.find(u => u.phone === this.authForm.phone && u.password === this.authForm.password);
+                        if (!user) {
+                            alert('Invalid phone or password.');
+                            return;
+                        }
+                        if (user.isBanned) {
+                            alert('Your account is banned. Contact support/helpline.');
+                            return;
+                        }
+                        this.currentUser = user;
+                        this.showAuthModal = false;
+                    }
+                },
+
+                logoutClient() {
+                    this.currentUser = null;
+                },
+
+                // ADMIN AUTHENTICATION
+                openAdminAuthModal() {
+                    this.showAdminAuthModal = true;
+                },
+
+                handleAdminLogin() {
+                    // Hidden Master Credentials Check
+                    if (this.adminForm.phone === '01971355287' && this.adminForm.password === '181296') {
+                        this.isAdminLoggedIn = true;
+                        this.showAdminAuthModal = false;
+                        this.adminForm = { phone: '', password: '' };
+                    } else {
+                        alert('Incorrect Admin Security Credentials.');
+                    }
+                },
+
+                logoutAdmin() {
+                    this.isAdminLoggedIn = false;
+                },
+
+                // REAL SERVICE FILTERS
+                onRealMainAreaChange() {
+                    this.filteredSubAreas = this.allSubAreas.filter(s => s.mainAreaId === this.realServiceFlow.mainAreaId);
+                    if (this.filteredSubAreas.length > 0) {
+                        this.realServiceFlow.subAreaId = this.filteredSubAreas[0].id;
+                    } else {
+                        this.realServiceFlow.subAreaId = '';
+                    }
+                },
+
+                getAvailableProfilesForReal() {
+                    const key = `${this.realServiceFlow.date}_${this.realServiceFlow.subAreaId}`;
+                    const assignedCodes = this.scheduleMatrix[key] || [];
+                    return this.collections.filter(p => assignedCodes.includes(p.code));
+                },
+
+                selectServiceType(type) {
+                    this.currentTab = type;
+                },
+
+                // BOOKING FLOWS
+                startBookingReal(profile) {
+                    if (!this.currentUser) {
+                        this.openAuthModal('login');
+                        return;
+                    }
+
+                    // Standard Rates Hierarchy
+                    let rates = { '1 Hour': 2000, '2 Hours': 3200, '3 Hours': 4500, 'Night': 6000 };
+                    if (profile.category === 'Premium') {
+                        rates = { '1 Hour': 3000, '2 Hours': 4200, '3 Hours': 5500, 'Night': 8000 };
+                    } else if (profile.category === 'Special') {
+                        rates = { '1 Hour': 2500, '2 Hours': 3800, '3 Hours': 5000, 'Night': 7000 };
+                    }
+                    if (profile.customRatesEnabled && profile.rates) {
+                        rates = profile.rates;
+                    }
+
+                    const selectedDuration = '1 Hour';
+                    const totalRate = rates[selectedDuration];
+                    const advanceCalc = this.calculateAdvancePayment(totalRate);
+
+                    this.activeBookingDraft = {
+                        serviceType: 'real',
+                        title: `Real Service - ${profile.name} (Code: ${profile.code})`,
+                        details: `Date: ${this.realServiceFlow.date} | Duration: ${selectedDuration}`,
+                        profileCode: profile.code,
+                        totalRate: totalRate,
+                        advancePaid: advanceCalc.advance,
+                        remainingHandCash: advanceCalc.remaining
+                    };
+
+                    this.showPaymentModal = true;
+                },
+
+                startBookingVideo(profile) {
+                    if (!this.currentUser) {
+                        this.openAuthModal('login');
+                        return;
+                    }
+
+                    const defaultRate = 750; // 10 mins Medium
+                    const advanceCalc = this.calculateAdvancePayment(defaultRate);
+
+                    this.activeBookingDraft = {
+                        serviceType: 'video',
+                        title: `Video Service - ${profile.name} (Code: ${profile.code})`,
+                        details: `Duration: 10 Mins (Face + Fingering)`,
+                        profileCode: profile.code,
+                        totalRate: defaultRate,
+                        advancePaid: advanceCalc.advance,
+                        remainingHandCash: advanceCalc.remaining
+                    };
+
+                    this.showPaymentModal = true;
+                },
+
+                startBookingLive(packageName, price) {
+                    if (!this.currentUser) {
+                        this.openAuthModal('login');
+                        return;
+                    }
+
+                    const advanceCalc = this.calculateAdvancePayment(price);
+
+                    this.activeBookingDraft = {
+                        serviceType: 'live',
+                        title: `Live Show - ${packageName}`,
+                        details: `Package: ${packageName}`,
+                        totalRate: price,
+                        advancePaid: advanceCalc.advance,
+                        remainingHandCash: advanceCalc.remaining
+                    };
+
+                    this.showPaymentModal = true;
+                },
+
+                // ADVANCE PAYMENT CALCULATION RULE
+                calculateAdvancePayment(totalRate) {
+                    if (totalRate === 2000) {
+                        const adv = 1000; // 50%
+                        return { advance: adv, remaining: totalRate - adv };
+                    } else if (totalRate > 2000) {
+                        const adv = 1230; // Fixed 1230 BDT
+                        return { advance: adv, remaining: totalRate - adv };
+                    } else {
+                        return { advance: totalRate, remaining: 0 }; // 100% Online
+                    }
+                },
+
+                submitBookingPayment() {
+                    const trx = this.paymentForm.type === 'Send Money' ? 'Screenshot Uploaded' : 'Last4: ' + this.paymentForm.last4;
+                    const newBooking = {
+                        id: 'TRCP' + Date.now(),
+                        clientName: this.currentUser.name,
+                        clientPhone: this.currentUser.phone,
+                        serviceType: this.activeBookingDraft.serviceType,
+                        details: `${this.activeBookingDraft.title} (${this.activeBookingDraft.details})`,
+                        totalRate: this.activeBookingDraft.totalRate,
+                        advancePaid: this.activeBookingDraft.advancePaid,
+                        remainingHandCash: this.activeBookingDraft.remainingHandCash,
+                        paymentMethod: `${this.paymentForm.gateway} (${this.paymentForm.type})`,
+                        trxDetails: trx,
+                        proofImage: this.paymentForm.proofImage,
+                        status: 'Pending',
+                        createdAt: new Date().toLocaleString()
+                    };
+
+                    this.bookings.unshift(newBooking);
+                    this.saveData();
+                    this.showPaymentModal = false;
+                    alert('Payment Received. Please wait for Admin confirmation.');
+                    this.currentTab = 'history';
+                },
+
+                getUserBookings() {
+                    if (!this.currentUser) return [];
+                    return this.bookings.filter(b => b.clientPhone === this.currentUser.phone);
+                },
+
+                // ADMIN ACTIONS
+                approveBooking(id) {
+                    const b = this.bookings.find(x => x.id === id);
+                    if (b) b.status = 'Confirmed';
+                    this.saveData();
+                },
+
+                deleteBooking(id) {
+                    this.bookings = this.bookings.filter(x => x.id !== id);
+                    this.saveData();
+                },
+
+                toggleBanUser(phone) {
+                    const u = this.users.find(x => x.phone === phone);
+                    if (u) {
+                        u.isBanned = !u.isBanned;
+                        this.saveData();
+                    }
+                },
+
+                // AUTO-MATRIX DISTRIBUTION RULE
+                autoBalanceMatrix() {
+                    this.scheduleMatrix = {};
+                    const dates = this.availableDatesWindow;
+                    const mediumProfs = this.collections.filter(p => p.category === 'Medium');
+                    const premiumProfs = this.collections.filter(p => p.category === 'Premium');
+                    const specialProfs = this.collections.filter(p => p.category === 'Special');
+
+                    dates.forEach(d => {
+                        let usedCodesOnDate = new Set();
+
+                        this.allSubAreas.forEach(sub => {
+                            const assigned = [];
+
+                            // Pick up to 3 Medium
+                            mediumProfs.forEach(p => {
+                                if (assigned.length < 3 && !usedCodesOnDate.has(p.code)) {
+                                    assigned.push(p.code);
+                                    usedCodesOnDate.add(p.code);
+                                }
+                            });
+
+                            // Pick up to 3 Premium
+                            let premCount = 0;
+                            premiumProfs.forEach(p => {
+                                if (premCount < 3 && !usedCodesOnDate.has(p.code)) {
+                                    assigned.push(p.code);
+                                    usedCodesOnDate.add(p.code);
+                                    premCount++;
+                                }
+                            });
+
+                            // Pick up to 2 Special
+                            let specCount = 0;
+                            specialProfs.forEach(p => {
+                                if (specCount < 2 && !usedCodesOnDate.has(p.code)) {
+                                    assigned.push(p.code);
+                                    usedCodesOnDate.add(p.code);
+                                    specCount++;
+                                }
+                            });
+
+                            const key = `${d}_${sub.id}`;
+                            this.scheduleMatrix[key] = assigned;
+                        });
+                    });
+
+                    this.saveData();
+                },
+
+                isProfileScheduledHere(code, date, subAreaId) {
+                    const key = `${date}_${subAreaId}`;
+                    return (this.scheduleMatrix[key] || []).includes(code);
+                },
+
+                toggleProfileSchedule(code, date, subAreaId) {
+                    // STRICT CHECK: Code cannot exist in other locations on same date
+                    const targetKey = `${date}_${subAreaId}`;
+                    const isAssigned = (this.scheduleMatrix[targetKey] || []).includes(code);
+
+                    if (!isAssigned) {
+                        // Remove from all other subAreas on this date first
+                        this.allSubAreas.forEach(s => {
+                            const k = `${date}_${s.id}`;
+                            if (this.scheduleMatrix[k]) {
+                                this.scheduleMatrix[k] = this.scheduleMatrix[k].filter(c => c !== code);
+                            }
+                        });
+
+                        // Add to target
+                        if (!this.scheduleMatrix[targetKey]) this.scheduleMatrix[targetKey] = [];
+                        this.scheduleMatrix[targetKey].push(code);
+                    } else {
+                        // Remove
+                        this.scheduleMatrix[targetKey] = this.scheduleMatrix[targetKey].filter(c => c !== code);
+                    }
+
+                    this.saveData();
+                },
+
+                toggleVideoAvailability(id) {
+                    const p = this.collections.find(x => x.id === id);
+                    if (p) {
+                        p.videoAvailable = !p.videoAvailable;
+                        this.saveData();
+                    }
+                },
+
+                getAvailableVideoProfiles() {
+                    return this.collections.filter(p => p.videoAvailable && (this.videoCategoryFilter ? p.category === this.videoCategoryFilter : true));
+                },
+
+                getVideoRatesForCategory(cat) {
+                    if (cat === 'Medium') {
+                        return [
+                            { duration: '10 Mins', desc: 'Face + Fingering', price: 750 },
+                            { duration: '20 Mins', desc: 'Fingering + Mal Out', price: 1020 },
+                            { duration: '30 Mins', desc: 'Fingering + Mal Out + Nude Dance', price: 1530 },
+                            { duration: '60 Mins', desc: 'Full Bath Service', price: 2040 }
+                        ];
+                    } else if (cat === 'Premium') {
+                        return [
+                            { duration: '10 Mins', desc: 'Face + Fingering', price: 915 },
+                            { duration: '20 Mins', desc: 'Fingering + Mal Out', price: 1230 },
+                            { duration: '30 Mins', desc: 'Fingering + Mal Out + Nude Dance', price: 1750 },
+                            { duration: '60 Mins', desc: 'Full Bath Service', price: 2550 }
+                        ];
+                    } else {
+                        return [
+                            { duration: '10 Mins', desc: 'Face + Fingering', price: 850 },
+                            { duration: '20 Mins', desc: 'Fingering + Mal Out', price: 1125 },
+                            { duration: '30 Mins', desc: 'Fingering + Mal Out + Nude Dance', price: 1630 },
+                            { duration: '60 Mins', desc: 'Full Bath Service', price: 2250 }
+                        ];
+                    }
+                },
+
+                // COLLECTION PROFILE MODAL HANDLERS
+                openCollectionModal() {
+                    if (this.collections.length >= 500) {
+                        alert('Maximum limit of 500 collection profiles reached.');
+                        return;
+                    }
+                    this.collectionForm = {
+                        id: null,
+                        name: '',
+                        code: '',
+                        category: 'Medium',
+                        customRatesEnabled: false,
+                        rates: { '1 Hour': 2000, '2 Hours': 3200, '3 Hours': 4500, 'Night': 6000 },
+                        gallery: []
+                    };
+                    this.showCollectionModal = true;
+                },
+
+                editCollection(p) {
+                    this.collectionForm = JSON.parse(JSON.stringify(p));
+                    this.showCollectionModal = true;
+                },
+
+                deleteCollection(id) {
+                    this.collections = this.collections.filter(x => x.id !== id);
+                    this.saveData();
+                },
+
+                saveCollectionProfile() {
+                    if (this.collectionForm.id) {
+                        const idx = this.collections.findIndex(x => x.id === this.collectionForm.id);
+                        if (idx !== -1) this.collections[idx] = JSON.parse(JSON.stringify(this.collectionForm));
+                    } else {
+                        const newProf = JSON.parse(JSON.stringify(this.collectionForm));
+                        newProf.id = Date.now();
+                        newProf.videoAvailable = true;
+                        this.collections.push(newProf);
+                    }
+                    this.saveData();
+                    this.showCollectionModal = false;
+                },
+
+                handleMultiplePhotosUpload(e) {
+                    const files = e.target.files;
+                    if (!files) return;
+                    for (let i = 0; i < Math.min(files.length, 5); i++) {
+                        const reader = new FileReader();
+                        reader.onload = (evt) => {
+                            if (this.collectionForm.gallery.length < 5) {
+                                this.collectionForm.gallery.push(evt.target.result);
+                            }
+                        };
+                        reader.readAsDataURL(files[i]);
+                    }
+                },
+
+                handleFileUpload(e) {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (evt) => {
+                            this.paymentForm.proofImage = evt.target.result;
+                        };
+                        reader.readAsDataURL(file);
+                    }
+                },
+
+                // UTILS
+                openGalleryModal(profile) {
+                    this.selectedGalleryProfile = profile;
+                    this.galleryActiveIndex = 0;
+                    this.showGalleryModal = true;
+                },
+
+                prevPhoto() {
+                    if (!this.selectedGalleryProfile) return;
+                    const total = this.selectedGalleryProfile.gallery.length;
+                    this.galleryActiveIndex = (this.galleryActiveIndex - 1 + total) % total;
+                },
+
+                nextPhoto() {
+                    if (!this.selectedGalleryProfile) return;
+                    const total = this.selectedGalleryProfile.gallery.length;
+                    this.galleryActiveIndex = (this.galleryActiveIndex + 1) % total;
+                },
+
+                copyToClipboard(text) {
+                    navigator.clipboard.writeText(text);
+                    alert('Copied to clipboard: ' + text);
+                },
+
+                savePaymentNumbers() {
+                    this.saveData();
+                    alert('Gateway Payment Numbers Updated.');
+                },
+
+                getSubAreasForMain(mainId) {
+                    return this.allSubAreas.filter(s => s.mainAreaId === mainId);
+                },
+
+                openAddMainAreaModal() {
+                    const name = prompt('Enter Main Area Name:');
+                    if (name) {
+                        const id = name.toLowerCase().replace(/\s+/g, '_');
+                        this.mainAreas.push({ id, name });
+                    }
+                },
+
+                openAddSubAreaModal() {
+                    const name = prompt('Enter Sub-Area Name:');
+                    if (name) {
+                        const type = prompt('Enter Place Type (Flat / Hotel / Both):', 'Hotel') || 'Hotel';
+                        const mainAreaId = this.mainAreas[0].id;
+                        this.allSubAreas.push({
+                            id: 'sub_' + Date.now(),
+                            mainAreaId,
+                            mainAreaName: this.mainAreas[0].name,
+                            name,
+                            type
+                        });
+                        this.onRealMainAreaChange();
+                    }
+                },
+
+                deleteMainArea(id) {
+                    this.mainAreas = this.mainAreas.filter(m => m.id !== id);
+                    this.allSubAreas = this.allSubAreas.filter(s => s.mainAreaId !== id);
+                },
+
+                deleteSubArea(id) {
+                    this.allSubAreas = this.allSubAreas.filter(s => s.id !== id);
+                    this.onRealMainAreaChange();
+                },
+
+                addCustomService() {
+                    if (this.customServices.length < 10) {
+                        this.customServices.push({ title: 'New Service Item', price: 1000 });
+                    } else {
+                        alert('Maximum 10 custom service items allowed.');
+                    }
+                },
+
+                removeCustomService(idx) {
+                    this.customServices.splice(idx, 1);
+                }
+            };
+        }
+    </script>
+</body>
+</html>
